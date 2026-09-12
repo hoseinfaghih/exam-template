@@ -1,5 +1,224 @@
 ---
-# Install Monitoring. It must listen .
-# Add Prometheus as a datasource.
-# Add one dashboard with CPU and memory.
-[]
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install Prometheus and node exporter
+  ansible.builtin.apt:
+    name:
+      - prometheus
+      - prometheus-node-exporter
+      - wget
+      - gpg
+      - apt-transport-https
+    state: present
+
+- name: Create Grafana keyring directory
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+
+- name: Download Grafana GPG key
+  ansible.builtin.command:
+    cmd: wget -q -O /etc/apt/keyrings/grafana.asc https://apt.grafana.com/gpg.key
+    creates: /etc/apt/keyrings/grafana.asc
+
+- name: Add Grafana repository
+  ansible.builtin.apt_repository:
+    repo: "deb [signed-by=/etc/apt/keyrings/grafana.asc] https://apt.grafana.com stable main"
+    filename: grafana
+    state: present
+
+- name: Update apt cache after adding Grafana repository
+  ansible.builtin.apt:
+    update_cache: true
+
+- name: Install Grafana
+  ansible.builtin.apt:
+    name: grafana
+    state: present
+
+- name: Configure Prometheus
+  ansible.builtin.copy:
+    dest: /etc/prometheus/prometheus.yml
+    mode: "0644"
+    content: |
+      global:
+        scrape_interval: 15s
+
+      scrape_configs:
+        - job_name: prometheus
+          static_configs:
+            - targets:
+                - localhost:9090
+
+        - job_name: node_exporter
+          static_configs:
+            - targets:
+                - localhost:9100
+  notify: Restart Prometheus
+
+- name: Configure Grafana admin credentials
+  ansible.builtin.blockinfile:
+    path: /etc/grafana/grafana.ini
+    marker: "# {mark} ANSIBLE MANAGED ADMIN SETTINGS"
+    block: |
+      [security]
+      admin_user = admin
+      admin_password = admin123
+  notify: Restart Grafana
+
+- name: Create Grafana provisioning directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: root
+    group: grafana
+    mode: "0755"
+  loop:
+    - /etc/grafana/provisioning/datasources
+    - /etc/grafana/provisioning/dashboards
+    - /var/lib/grafana/dashboards
+
+- name: Configure Prometheus datasource
+  ansible.builtin.copy:
+    dest: /etc/grafana/provisioning/datasources/prometheus.yml
+    owner: root
+    group: grafana
+    mode: "0644"
+    content: |
+      apiVersion: 1
+
+      datasources:
+        - name: Prometheus
+          type: prometheus
+          uid: prometheus
+          access: proxy
+          url: http://localhost:9090
+          isDefault: true
+          editable: false
+  notify: Restart Grafana
+
+- name: Configure dashboard provisioning
+  ansible.builtin.copy:
+    dest: /etc/grafana/provisioning/dashboards/dashboard.yml
+    owner: root
+    group: grafana
+    mode: "0644"
+    content: |
+      apiVersion: 1
+
+      providers:
+        - name: monitoring
+          orgId: 1
+          folder: Monitoring
+          type: file
+          disableDeletion: false
+          editable: true
+          options:
+            path: /var/lib/grafana/dashboards
+  notify: Restart Grafana
+
+- name: Install CPU and memory dashboard
+  ansible.builtin.copy:
+    dest: /var/lib/grafana/dashboards/node-exporter.json
+    owner: root
+    group: grafana
+    mode: "0644"
+    content: |
+      {
+        "title": "Node Exporter - CPU and Memory",
+        "uid": "node-exporter-cpu-memory",
+        "schemaVersion": 39,
+        "version": 1,
+        "refresh": "10s",
+        "panels": [
+          {
+            "id": 1,
+            "title": "CPU Usage",
+            "type": "timeseries",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus"
+            },
+            "targets": [
+              {
+                "expr": "100 - (avg by(instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+                "legendFormat": "CPU Usage %",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "percent"
+              }
+            },
+            "gridPos": {
+              "h": 8,
+              "w": 12,
+              "x": 0,
+              "y": 0
+            }
+          },
+          {
+            "id": 2,
+            "title": "Memory Usage",
+            "type": "timeseries",
+            "datasource": {
+              "type": "prometheus",
+              "uid": "prometheus"
+            },
+            "targets": [
+              {
+                "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100",
+                "legendFormat": "Memory Usage %",
+                "refId": "A"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "unit": "percent"
+              }
+            },
+            "gridPos": {
+              "h": 8,
+              "w": 12,
+              "x": 12,
+              "y": 0
+            }
+          }
+        ]
+      }
+  notify: Restart Grafana
+
+- name: Enable and start node exporter
+  ansible.builtin.systemd:
+    name: prometheus-node-exporter
+    enabled: true
+    state: started
+
+- name: Enable and start Prometheus
+  ansible.builtin.systemd:
+    name: prometheus
+    enabled: true
+    state: started
+
+- name: Enable and start Grafana
+  ansible.builtin.systemd:
+    name: grafana-server
+    enabled: true
+    state: started
+
+- name: Wait for Prometheus
+  ansible.builtin.wait_for:
+    port: "{{ prometheus_port }}"
+    host: 127.0.0.1
+    timeout: 60
+
+- name: Wait for Grafana
+  ansible.builtin.wait_for:
+    port: "{{ grafana_port }}"
+    host: 127.0.0.1
+    timeout: 60
